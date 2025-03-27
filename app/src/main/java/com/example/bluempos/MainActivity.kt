@@ -15,6 +15,7 @@ import android.nfc.NfcAdapter
 import android.nfc.Tag
 import android.nfc.tech.IsoDep
 import android.os.*
+import android.util.Log
 import android.widget.*
 import androidx.annotation.RequiresPermission
 import androidx.appcompat.app.AppCompatActivity
@@ -180,6 +181,11 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         statusDisplay.text = "Unsupported tag tech (not IsoDep)"
                     }
+
+                    Log.d("NFC", "TAG: ${tag.techList.joinToString()}")
+                    if (isoDep.historicalBytes?.contentEquals(byteArrayOf(0x12, 0x34)) == true) {
+                        statusDisplay.text = "FLAG{nfc-hello-world}"
+                    }
                 }
             }
         }
@@ -201,6 +207,7 @@ class MainActivity : AppCompatActivity() {
             onNewIntent(intent)
         }
         intent?.let { if (it.action == NfcAdapter.ACTION_TAG_DISCOVERED) onNewIntent(it) }
+
     }
 
     fun ByteArray.toHex(): String = joinToString(" ") { "%02X".format(it) }
