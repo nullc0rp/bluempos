@@ -1,7 +1,6 @@
 package com.example.bluempos
 
-// BLE mPOS App with Keypad and NFC Stub
-// Updated to include price input via keypad UI
+// BLE mPOS App with Keypad and NFC Stub + Extra BLE Characteristics
 
 import android.Manifest
 import android.app.*
@@ -29,11 +28,17 @@ class MainActivity : AppCompatActivity() {
 
     private val SERVICE_UUID = UUID.fromString("0000abcd-0000-1000-8000-00805f9b34fb")
     private val CHARACTERISTIC_UUID = UUID.fromString("00001234-0000-1000-8000-00805f9b34fb")
+    private val BATTERY_UUID = UUID.fromString("00001235-0000-1000-8000-00805f9b34fb")
+    private val VERSION_UUID = UUID.fromString("00001236-0000-1000-8000-00805f9b34fb")
+    private val RANDOM_UUID = UUID.fromString("00001237-0000-1000-8000-00805f9b34fb")
+    private val TXLIST_UUID = UUID.fromString("00001238-0000-1000-8000-00805f9b34fb")
+    private val SERIAL_UUID = UUID.fromString("00001239-0000-1000-8000-00805f9b34fb")
 
     private lateinit var priceDisplay: TextView
     private lateinit var statusDisplay: TextView
     private var currentInput = StringBuilder()
     private var isFlagUnlocked = false
+    private val transactionList = listOf("TXN12345: $10.00", "TXN12346: $22.50", "TXN12347: $5.75")
 
     override fun onPause() {
         super.onPause()
@@ -83,10 +88,7 @@ class MainActivity : AppCompatActivity() {
         startAdvertising()
     }
 
-    @RequiresPermission(allOf = [
-        android.Manifest.permission.BLUETOOTH_ADVERTISE,
-        android.Manifest.permission.BLUETOOTH_CONNECT
-    ])
+    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT])
     private fun startGattServer() {
         gattServer = bleManager.openGattServer(this, object : BluetoothGattServerCallback() {
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
@@ -97,18 +99,28 @@ class MainActivity : AppCompatActivity() {
 
             @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
             override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
-                if (characteristic.uuid == CHARACTERISTIC_UUID) {
-                    val value = if (isFlagUnlocked) "FLAG{ble-basic-read}" else "LOCKED"
-                    gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value.toByteArray())
+                val value = when (characteristic.uuid) {
+                    CHARACTERISTIC_UUID -> if (isFlagUnlocked) "FLAG{ble-basic-read}" else "LOCKED"
+                    BATTERY_UUID -> "Battery: 86%"
+                    VERSION_UUID -> "API Version: 1.3.2"
+                    RANDOM_UUID -> UUID.randomUUID().toString() //TODO implement challenge
+                    TXLIST_UUID -> transactionList.getOrNull(currentInput.toString().toIntOrNull() ?: -1) ?: "INVALID TX ID"
+                    else -> "UNKNOWN"
                 }
+                gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value.toByteArray())
             }
 
             @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
             override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
-                if (characteristic.uuid == CHARACTERISTIC_UUID && value?.decodeToString()?.trim() == "SEND_FLAG_2") {
-                    isFlagUnlocked = true
-                    runOnUiThread {
-                        statusDisplay.text = "BLE Command Accepted. Notifying..."
+                val str = value?.decodeToString()?.trim()
+                when (characteristic.uuid) {
+                    CHARACTERISTIC_UUID -> {
+                        if (str == "SEND_FLAG_2") isFlagUnlocked = true
+                        runOnUiThread { statusDisplay.text = "BLE Command Accepted." }
+                    }
+                    SERIAL_UUID -> {
+                        val response = handleCommand(str ?: "")
+                        characteristic.value = response.toByteArray()
                     }
                 }
                 if (responseNeeded) {
@@ -118,13 +130,31 @@ class MainActivity : AppCompatActivity() {
         })
 
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        val characteristic = BluetoothGattCharacteristic(
+        listOf(
             CHARACTERISTIC_UUID,
-            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE,
-            BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
-        )
-        service.addCharacteristic(characteristic)
+            BATTERY_UUID,
+            VERSION_UUID,
+            RANDOM_UUID,
+            TXLIST_UUID,
+            SERIAL_UUID
+        ).forEach { uuid ->
+            val characteristic = BluetoothGattCharacteristic(
+                uuid,
+                BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE,
+                BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+            service.addCharacteristic(characteristic)
+        }
         gattServer.addService(service)
+    }
+
+    private fun handleCommand(cmd: String): String {
+        return when (cmd.lowercase()) {
+            "ping" -> "pong"
+            "flag" -> if (isFlagUnlocked) "FLAG{ble-basic-read}" else "NO FLAG"
+            "price" -> "${currentInput}"
+            else -> "UNKNOWN COMMAND"
+        }
     }
 
     @RequiresPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
@@ -183,7 +213,7 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     Log.d("NFC", "TAG: ${tag.techList.joinToString()}")
-                    if (isoDep.historicalBytes?.contentEquals(byteArrayOf(0x12, 0x34)) == true) {
+                    if (IsoDep.get(tag)?.historicalBytes?.contentEquals(byteArrayOf(0x12, 0x34)) == true) {
                         statusDisplay.text = "FLAG{nfc-hello-world}"
                     }
                 }
@@ -202,14 +232,11 @@ class MainActivity : AppCompatActivity() {
 
         nfcAdapter.enableForegroundDispatch(this, pendingIntent, filters, techLists)
 
-        // Handle NFC if resumed from intent
         if (intent.action == NfcAdapter.ACTION_TECH_DISCOVERED) {
             onNewIntent(intent)
         }
         intent?.let { if (it.action == NfcAdapter.ACTION_TAG_DISCOVERED) onNewIntent(it) }
-
     }
 
     fun ByteArray.toHex(): String = joinToString(" ") { "%02X".format(it) }
-
 }
