@@ -1,30 +1,34 @@
 package com.example.bluempos
 
-// BLE mPOS App with Keypad and NFC Stub + Extra BLE Characteristics
-
-import android.Manifest
-import android.app.*
-import android.bluetooth.*
-import android.bluetooth.le.*
-import android.content.Context
+import android.app.PendingIntent
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattServer
+import android.bluetooth.BluetoothGattServerCallback
+import android.bluetooth.BluetoothGattService
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseData
+import android.bluetooth.le.AdvertiseSettings
 import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.PackageManager
-import android.nfc.NfcAdapter
-import android.nfc.Tag
-import android.nfc.tech.IsoDep
-import android.os.*
+import android.os.Bundle
+import android.os.ParcelUuid
 import android.util.Log
-import android.widget.*
-import androidx.annotation.RequiresPermission
+import android.widget.Button
+import android.widget.GridLayout
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import java.util.*
+import java.io.FileWriter
+import java.io.IOException
+import java.io.PrintWriter
+import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
     private lateinit var bleManager: BluetoothManager
     private lateinit var bleAdapter: BluetoothAdapter
     private lateinit var gattServer: BluetoothGattServer
-    private lateinit var nfcAdapter: NfcAdapter
 
     private val SERVICE_UUID = UUID.fromString("0000abcd-0000-1000-8000-00805f9b34fb")
     private val CHARACTERISTIC_UUID = UUID.fromString("00001234-0000-1000-8000-00805f9b34fb")
@@ -40,14 +44,18 @@ class MainActivity : AppCompatActivity() {
     private var isFlagUnlocked = false
     private val transactionList = listOf("TXN12345: $10.00", "TXN12346: $22.50", "TXN12347: $5.75")
 
-    override fun onPause() {
-        super.onPause()
-        nfcAdapter.disableForegroundDispatch(this)
-    }
-
-    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT])
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Thread.setDefaultUncaughtExceptionHandler { thread: Thread?, e: Throwable ->
+            try {
+                FileWriter(getExternalFilesDir(null).toString() + "/crashlog.txt")
+                    .use { writer ->
+                        e.printStackTrace(PrintWriter(writer))
+                    }
+            } catch (ex: IOException) {
+                ex.printStackTrace()
+            }
+        }
         setContentView(R.layout.activity_main)
 
         priceDisplay = findViewById(R.id.priceDisplay)
@@ -72,7 +80,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.acceptButton).setOnClickListener {
-            statusDisplay.text = "Waiting for NFC Card..."
+            statusDisplay.text = "Waiting for BLE Connection..."
         }
 
         findViewById<Button>(R.id.cancelButton).setOnClickListener {
@@ -83,12 +91,10 @@ class MainActivity : AppCompatActivity() {
         bleManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
         bleAdapter = bleManager.adapter
 
-        nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         startGattServer()
         startAdvertising()
     }
 
-    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT])
     private fun startGattServer() {
         gattServer = bleManager.openGattServer(this, object : BluetoothGattServerCallback() {
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
@@ -97,20 +103,18 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
             override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int, offset: Int, characteristic: BluetoothGattCharacteristic) {
                 val value = when (characteristic.uuid) {
                     CHARACTERISTIC_UUID -> if (isFlagUnlocked) "FLAG{ble-basic-read}" else "LOCKED"
                     BATTERY_UUID -> "Battery: 86%"
                     VERSION_UUID -> "API Version: 1.3.2"
-                    RANDOM_UUID -> UUID.randomUUID().toString() //TODO implement challenge
+                    RANDOM_UUID -> UUID.randomUUID().toString()
                     TXLIST_UUID -> transactionList.getOrNull(currentInput.toString().toIntOrNull() ?: -1) ?: "INVALID TX ID"
                     else -> "UNKNOWN"
                 }
                 gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value.toByteArray())
             }
 
-            @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
             override fun onCharacteristicWriteRequest(device: BluetoothDevice, requestId: Int, characteristic: BluetoothGattCharacteristic, preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray?) {
                 val str = value?.decodeToString()?.trim()
                 when (characteristic.uuid) {
@@ -157,7 +161,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    @RequiresPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
     private fun startAdvertising() {
         val advertiser = bleAdapter.bluetoothLeAdvertiser
         val settings = AdvertiseSettings.Builder()
@@ -184,59 +187,4 @@ class MainActivity : AppCompatActivity() {
             }
         })
     }
-
-    override fun onNewIntent(intent: Intent?) {
-        super.onNewIntent(intent)
-
-        intent?.let {
-            if (NfcAdapter.ACTION_TECH_DISCOVERED == it.action) {
-                val tag: Tag? = it.getParcelableExtra(NfcAdapter.EXTRA_TAG)
-                statusDisplay.text = "NFC Tag detected!"
-
-                tag?.let { nfcTag ->
-                    val isoDep = IsoDep.get(nfcTag)
-
-                    if (isoDep != null) {
-                        try {
-                            isoDep.connect()
-                            if (isoDep.isConnected) {
-                                val atr = isoDep.hiLayerResponse ?: byteArrayOf()
-                                val historicalBytes = isoDep.historicalBytes ?: byteArrayOf()
-                                statusDisplay.text = "NFC Connected!\nATR: ${atr.toHex()}"
-                            }
-                            isoDep.close()
-                        } catch (e: Exception) {
-                            statusDisplay.text = "NFC Error: ${e.message}"
-                        }
-                    } else {
-                        statusDisplay.text = "Unsupported tag tech (not IsoDep)"
-                    }
-
-                    Log.d("NFC", "TAG: ${tag.techList.joinToString()}")
-                    if (IsoDep.get(tag)?.historicalBytes?.contentEquals(byteArrayOf(0x12, 0x34)) == true) {
-                        statusDisplay.text = "FLAG{nfc-hello-world}"
-                    }
-                }
-            }
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        val intent = Intent(this, javaClass).apply {
-            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-        }
-        val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_MUTABLE)
-        val filters = arrayOf<IntentFilter>()
-        val techLists = arrayOf(arrayOf(IsoDep::class.java.name))
-
-        nfcAdapter.enableForegroundDispatch(this, pendingIntent, filters, techLists)
-
-        if (intent.action == NfcAdapter.ACTION_TECH_DISCOVERED) {
-            onNewIntent(intent)
-        }
-        intent?.let { if (it.action == NfcAdapter.ACTION_TAG_DISCOVERED) onNewIntent(it) }
-    }
-
-    fun ByteArray.toHex(): String = joinToString(" ") { "%02X".format(it) }
 }
